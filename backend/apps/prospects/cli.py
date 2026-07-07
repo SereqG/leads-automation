@@ -1,13 +1,26 @@
+import logging
 from pathlib import Path
 from typing import Optional
 
 import typer
 
 from core.exceptions import ValidationFailedError
+from core.logging import LOGGER_NAME
 
 from . import services
 
 app = typer.Typer(help="Prospect discovery commands")
+
+
+def _confirm_deduplication(report: services.DuplicateQueryReport) -> bool:
+    count = len(report.duplicate_queries)
+    typer.secho(
+        f"Found {count} duplicate quer{'y' if count == 1 else 'ies'} in queries.csv:",
+        fg=typer.colors.YELLOW,
+    )
+    for query in report.duplicate_queries:
+        typer.echo(f"  - {query}")
+    return typer.confirm("Deduplicate queries.csv now?")
 
 
 @app.command("search")
@@ -40,3 +53,12 @@ def search(
     typer.secho(
         f"Validation successful. Logging to {config.log_file}", fg=typer.colors.GREEN
     )
+
+    logger = logging.getLogger(LOGGER_NAME)
+    queries_path = services.check_and_deduplicate_queries(
+        config.queries_csv_path, logger, _confirm_deduplication
+    )
+    if queries_path != config.queries_csv_path:
+        typer.secho(
+            f"Using deduplicated queries file: {queries_path}", fg=typer.colors.GREEN
+        )

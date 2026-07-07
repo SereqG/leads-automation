@@ -1,3 +1,4 @@
+import logging
 import re
 
 import pytest
@@ -240,3 +241,144 @@ def test_cli_search_failure(valid_env):
     )
     assert result.exit_code == 1
     assert "Error:" in result.output
+
+
+# --- queries.csv duplicate detection ---
+
+
+def test_find_duplicate_queries_none_found(valid_env):
+    report = services.find_duplicate_queries(valid_env["queries_csv"])
+    assert report.duplicate_queries == []
+    assert report.duplicate_row_count == 0
+    assert report.total_rows == 1
+
+
+def test_find_duplicate_queries_detects_duplicates(valid_env):
+    valid_env["queries_csv"].write_text(
+        "google_search_query\n"
+        "plumbers in Chicago\n"
+        "  Plumbers in Chicago  \n"
+        "electricians in Boston\n"
+        "electricians in Boston\n"
+    )
+    report = services.find_duplicate_queries(valid_env["queries_csv"])
+    assert report.total_rows == 4
+    assert report.duplicate_row_count == 2
+    assert report.duplicate_queries == ["plumbers in Chicago", "electricians in Boston"]
+
+
+# --- queries.csv deduplication ---
+
+
+def test_deduplicate_queries_csv_writes_unique_rows(valid_env, tmp_path):
+    valid_env["queries_csv"].write_text(
+        "google_search_query\n"
+        "plumbers in Chicago\n"
+        "PLUMBERS IN CHICAGO\n"
+        "electricians in Boston\n"
+    )
+    dest = valid_env["data_dir"] / "queries-copy.csv"
+
+    result = services.deduplicate_queries_csv(valid_env["queries_csv"], dest)
+
+    assert result.dest_path == dest
+    assert result.total_rows == 3
+    assert result.unique_rows == 2
+    assert result.removed_count == 1
+    assert dest.read_text() == (
+        "google_search_query\nplumbers in Chicago\nelectricians in Boston\n"
+    )
+
+
+def test_resolve_queries_copy_path(valid_env):
+    dest = services.resolve_queries_copy_path(valid_env["queries_csv"])
+    assert dest == valid_env["data_dir"] / "queries-copy.csv"
+
+
+# --- check_and_deduplicate_queries orchestration ---
+
+
+def test_check_and_deduplicate_no_duplicates_skips_prompt(valid_env):
+    logger = logging.getLogger("test-dedup-none")
+    confirm_callback = lambda report: pytest.fail("should not be called")  # noqa: E731
+
+    result_path = services.check_and_deduplicate_queries(
+        valid_env["queries_csv"], logger, confirm_callback
+    )
+    assert result_path == valid_env["queries_csv"]
+
+
+def test_check_and_deduplicate_confirmed_writes_copy(valid_env):
+    valid_env["queries_csv"].write_text(
+        "google_search_query\nplumbers in Chicago\nplumbers in Chicago\n"
+    )
+    logger = logging.getLogger("test-dedup-confirmed")
+
+    result_path = services.check_and_deduplicate_queries(
+        valid_env["queries_csv"], logger, lambda report: True
+    )
+
+    expected_copy = valid_env["data_dir"] / "queries-copy.csv"
+    assert result_path == expected_copy
+    assert expected_copy.exists()
+
+
+def test_check_and_deduplicate_declined_keeps_original(valid_env):
+    valid_env["queries_csv"].write_text(
+        "google_search_query\nplumbers in Chicago\nplumbers in Chicago\n"
+    )
+    logger = logging.getLogger("test-dedup-declined")
+
+    result_path = services.check_and_deduplicate_queries(
+        valid_env["queries_csv"], logger, lambda report: False
+    )
+
+    assert result_path == valid_env["queries_csv"]
+    assert not (valid_env["data_dir"] / "queries-copy.csv").exists()
+
+
+# --- CLI smoke tests: duplicate confirmation prompt ---
+
+
+def test_cli_search_prompts_and_dedupes_on_confirm(valid_env):
+    valid_env["queries_csv"].write_text(
+        "google_search_query\nplumbers in Chicago\nplumbers in Chicago\n"
+    )
+    result = runner.invoke(
+        root_app,
+        [
+            "prospects",
+            "search",
+            "--per-query",
+            "5",
+            "--contact-email",
+            "test@example.com",
+        ],
+        input="y\n",
+    )
+    assert result.exit_code == 0
+    assert "duplicate quer" in result.output
+    assert "Using deduplicated queries file" in result.output
+    assert (valid_env["data_dir"] / "queries-copy.csv").exists()
+
+
+def test_cli_search_prompts_and_keeps_original_on_decline(valid_env):
+    valid_env["queries_csv"].write_text(
+        "google_search_query\nplumbers in Chicago\nplumbers in Chicago\n"
+    )
+    result = runner.invoke(
+        root_app,
+        [
+            "prospects",
+            "search",
+            "--per-query",
+            "5",
+            "--contact-email",
+            "test@example.com",
+        ],
+        input="n\n",
+    )
+    assert result.exit_code == 0
+    assert "duplicate quer" in result.output
+    assert "Using deduplicated queries file" not in result.output
+    assert not (valid_env["data_dir"] / "queries-copy.csv").exists()
