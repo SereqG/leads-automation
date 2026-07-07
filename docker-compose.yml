@@ -1,0 +1,45 @@
+services:
+  api:
+    build: .
+    env_file: .env
+    volumes:
+      - ./backend:/backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+
+  postgres:
+    image: postgres:16-alpine
+    env_file: .env
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  worker:
+    build: .
+    command: celery -A config.celery_app worker --loglevel=info
+    env_file: .env
+    volumes:
+      - ./backend:/backend
+    depends_on:
+      - redis
+
+  beat:
+    build: .
+    command: celery -A config.celery_app beat --loglevel=info
+    env_file: .env
+    volumes:
+      - ./backend:/backend
+    depends_on:
+      - redis
+
+volumes:
+  postgres_data:
