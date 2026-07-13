@@ -32,3 +32,9 @@ htmlcov/
 # IDE
 .vscode/
 .idea/
+
+# Docker certs (local trust store, not for repo)
+docker/certs/
+
+# Review notes (local scratch, not for repo)
+review/

@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Optional
 
 LOGGER_NAME = "leadgen"
+DEFAULT_LOG_DIR = Path("/backend/logs")
 
 
 def configure_logging(

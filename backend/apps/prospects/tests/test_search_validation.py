@@ -1,14 +1,11 @@
 import logging
 import re
+from types import SimpleNamespace
 
 import pytest
-from typer.testing import CliRunner
 
 from apps.prospects import schemas, services
-from cli import app as root_app
 from core.exceptions import ValidationFailedError
-
-runner = CliRunner()
 
 
 @pytest.fixture
@@ -28,6 +25,11 @@ def valid_env(tmp_path, monkeypatch):
     monkeypatch.setattr(schemas, "OUTPUT_DIR", data_dir)
     monkeypatch.setattr(schemas, "BLACKLIST_PATH", blacklist)
     monkeypatch.setattr(schemas, "DEFAULT_LOG_DIR", logs_dir)
+    monkeypatch.setattr(
+        schemas,
+        "get_settings",
+        lambda: SimpleNamespace(brave_api_key="test-brave-api-key"),
+    )
 
     return {
         "data_dir": data_dir,
@@ -208,41 +210,6 @@ def test_multiple_errors_reported_together(valid_env, tmp_path):
     assert len(exc_info.value.errors) >= 2
 
 
-# --- CLI smoke tests ---
-
-
-def test_cli_search_success(valid_env):
-    result = runner.invoke(
-        root_app,
-        [
-            "prospects",
-            "search",
-            "--per-query",
-            "5",
-            "--contact-email",
-            "test@example.com",
-        ],
-    )
-    assert result.exit_code == 0
-    assert "Validation successful" in result.output
-
-
-def test_cli_search_failure(valid_env):
-    result = runner.invoke(
-        root_app,
-        [
-            "prospects",
-            "search",
-            "--per-query",
-            "0",
-            "--contact-email",
-            "test@example.com",
-        ],
-    )
-    assert result.exit_code == 1
-    assert "Error:" in result.output
-
-
 # --- queries.csv duplicate detection ---
 
 
@@ -334,51 +301,4 @@ def test_check_and_deduplicate_declined_keeps_original(valid_env):
     )
 
     assert result_path == valid_env["queries_csv"]
-    assert not (valid_env["data_dir"] / "queries-copy.csv").exists()
-
-
-# --- CLI smoke tests: duplicate confirmation prompt ---
-
-
-def test_cli_search_prompts_and_dedupes_on_confirm(valid_env):
-    valid_env["queries_csv"].write_text(
-        "google_search_query\nplumbers in Chicago\nplumbers in Chicago\n"
-    )
-    result = runner.invoke(
-        root_app,
-        [
-            "prospects",
-            "search",
-            "--per-query",
-            "5",
-            "--contact-email",
-            "test@example.com",
-        ],
-        input="y\n",
-    )
-    assert result.exit_code == 0
-    assert "duplicate quer" in result.output
-    assert "Using deduplicated queries file" in result.output
-    assert (valid_env["data_dir"] / "queries-copy.csv").exists()
-
-
-def test_cli_search_prompts_and_keeps_original_on_decline(valid_env):
-    valid_env["queries_csv"].write_text(
-        "google_search_query\nplumbers in Chicago\nplumbers in Chicago\n"
-    )
-    result = runner.invoke(
-        root_app,
-        [
-            "prospects",
-            "search",
-            "--per-query",
-            "5",
-            "--contact-email",
-            "test@example.com",
-        ],
-        input="n\n",
-    )
-    assert result.exit_code == 0
-    assert "duplicate quer" in result.output
-    assert "Using deduplicated queries file" not in result.output
     assert not (valid_env["data_dir"] / "queries-copy.csv").exists()

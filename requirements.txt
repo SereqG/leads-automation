@@ -14,6 +14,10 @@ psycopg2-binary>=2.9
 celery>=5.4
 redis>=5.0
 
+requests>=2.32
+openpyxl>=3.1
+truststore>=0.9
+
 python-dotenv>=1.0
 
 pytest>=8.3

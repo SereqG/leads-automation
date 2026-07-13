@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     env: str = "development"
     database_url: str = "postgresql://leadgen:leadgen@postgres:5432/leadgen"
     redis_url: str = "redis://redis:6379/0"
+    brave_api_key: str = ""
 
 
 @lru_cache

@@ -1,37 +1,21 @@
 import csv
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
-from pydantic import ValidationError as PydanticValidationError
+import requests
+from openpyxl import Workbook
 
-from core.exceptions import ValidationFailedError
+from core import validation as core_validation
 from core.logging import configure_logging
 
 from . import schemas
 
 QUERIES_COPY_FILENAME = "queries-copy.csv"
-
-
-def resolve_log_path(log_file: Optional[Path]) -> Path:
-    if log_file is not None:
-        return log_file
-    schemas.DEFAULT_LOG_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return schemas.DEFAULT_LOG_DIR / f"{timestamp}.log"
-
-
-def _configure_failure_logger(preferred_log_file: Path) -> tuple[Path, logging.Logger]:
-    """Attach a file handler for the failure log, falling back to the default
-    log directory if the requested path itself can't be opened (e.g. its
-    parent directory is missing — one of the possible validation failures)."""
-    try:
-        return preferred_log_file, configure_logging(log_file=preferred_log_file)
-    except OSError:
-        fallback_log_file = resolve_log_path(None)
-        return fallback_log_file, configure_logging(log_file=fallback_log_file)
 
 
 def validate_search_inputs(
@@ -40,35 +24,21 @@ def validate_search_inputs(
     bootstrap_logger = configure_logging(log_file=None)
     bootstrap_logger.info("Validating prospect search inputs...")
 
-    resolved_log_file = resolve_log_path(log_file)
+    resolved_log_file = core_validation.resolve_log_path(
+        log_file, schemas.DEFAULT_LOG_DIR
+    )
 
-    try:
-        config = schemas.ProspectSearchConfig(
-            per_query=per_query,
-            contact_email=contact_email,
-            log_file=resolved_log_file,
-        )
-    except PydanticValidationError as exc:
-        errors = exc.errors()
-        messages = [error["msg"] for error in errors]
-
-        failure_log_file, failure_logger = _configure_failure_logger(resolved_log_file)
-        if failure_log_file != resolved_log_file:
-            failure_logger.warning(
-                "Could not write to requested log file %s; writing to %s instead",
-                resolved_log_file,
-                failure_log_file,
-            )
-        failure_logger.error("Validation failed for prospect search inputs:")
-        for error in errors:
-            field = ".".join(str(part) for part in error["loc"])
-            failure_logger.error(
-                "  field=%s invalid_value=%r reason=%s",
-                field,
-                error.get("input"),
-                error["msg"],
-            )
-        raise ValidationFailedError(messages) from exc
+    config = core_validation.validate_config(
+        schemas.ProspectSearchConfig,
+        {
+            "per_query": per_query,
+            "contact_email": contact_email,
+            "log_file": resolved_log_file,
+        },
+        resolved_log_file,
+        schemas.DEFAULT_LOG_DIR,
+        "prospect search inputs",
+    )
 
     logger = configure_logging(log_file=config.log_file)
     logger.info(
@@ -208,3 +178,264 @@ def check_and_deduplicate_queries(
         result.removed_count,
     )
     return result.dest_path
+
+
+@dataclass(frozen=True)
+class SearchResultRow:
+    id: int
+    domain: str
+    query: str
+
+
+def extract_domain(url: str) -> Optional[str]:
+    """Return the lowercased hostname of a URL (e.g. "shop.example.com"),
+    or None if the URL has no parseable hostname. Subdomains are kept as-is
+    and "www." is not stripped."""
+    hostname = urlparse(url).hostname
+    return hostname.lower() if hostname else None
+
+
+def read_queries(csv_path: Path) -> list[str]:
+    _, data_rows = _read_csv_rows(csv_path)
+    queries: list[str] = []
+    for row in data_rows:
+        if not row:
+            continue
+        query = row[0].strip()
+        if query:
+            queries.append(query)
+    return queries
+
+
+def compute_pagination_plan(per_query: int) -> list[tuple[int, int]]:
+    """Return (count, offset) pairs needed to fetch up to per_query results,
+    respecting Brave's limits (count 1-20, offset 0-9, i.e. 200 max/query).
+    Silently caps at the max; callers that want to warn about capping check
+    per_query themselves."""
+    remaining = min(per_query, schemas.BRAVE_MAX_RESULTS_PER_QUERY)
+    pairs: list[tuple[int, int]] = []
+    offset = 0
+    while remaining > 0 and offset <= schemas.BRAVE_MAX_OFFSET:
+        count = min(schemas.BRAVE_MAX_COUNT, remaining)
+        pairs.append((count, offset))
+        remaining -= count
+        offset += 1
+    return pairs
+
+
+def fetch_brave_results(
+    query: str,
+    per_query: int,
+    api_key: str,
+    logger: logging.Logger,
+    http_get: Callable[..., requests.Response] = requests.get,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> list[str]:
+    if per_query > schemas.BRAVE_MAX_RESULTS_PER_QUERY:
+        logger.warning(
+            "per_query=%d for query=%r exceeds Brave's max of %d results/query "
+            "(count<=%d x offset<=%d); capping to %d",
+            per_query,
+            query,
+            schemas.BRAVE_MAX_RESULTS_PER_QUERY,
+            schemas.BRAVE_MAX_COUNT,
+            schemas.BRAVE_MAX_OFFSET,
+            schemas.BRAVE_MAX_RESULTS_PER_QUERY,
+        )
+
+    headers = {"X-Subscription-Token": api_key, "Accept": "application/json"}
+    urls: list[str] = []
+
+    for count, offset in compute_pagination_plan(per_query):
+        sleep_fn(schemas.REQUEST_DELAY_SECONDS)
+        logger.info("Fetching query=%r count=%d offset=%d", query, count, offset)
+        try:
+            response = http_get(
+                schemas.BRAVE_SEARCH_URL,
+                headers=headers,
+                params={"q": query, "count": count, "offset": offset},
+                timeout=30,
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            logger.error(
+                "Brave Search request failed for query=%r count=%d offset=%d: %s",
+                query,
+                count,
+                offset,
+                exc,
+            )
+            break
+
+        page_results = response.json().get("web", {}).get("results", [])
+        urls.extend(item["url"] for item in page_results if "url" in item)
+
+        if len(page_results) < count:
+            logger.info(
+                "query=%r returned %d/%d results at offset=%d; stopping pagination",
+                query,
+                len(page_results),
+                count,
+                offset,
+            )
+            break
+
+    return urls
+
+
+def load_blacklist(blacklist_path: Path) -> set[str]:
+    """Parse blacklist.txt into a set of lowercased domains. Blank lines and
+    lines starting with '#' (comments/section headers) are ignored."""
+    domains: set[str] = set()
+    for line in blacklist_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        domains.add(stripped.lower())
+    return domains
+
+
+def is_blacklisted(domain: str, blacklist: set[str]) -> bool:
+    """Return True if domain exactly matches a blacklist entry, or is a
+    subdomain of one (e.g. "shop.amazon.pl" matches blacklisted "amazon.pl")."""
+    return any(domain == entry or domain.endswith(f".{entry}") for entry in blacklist)
+
+
+def filter_blacklisted_rows(
+    rows: list[SearchResultRow], blacklist: set[str]
+) -> list[SearchResultRow]:
+    """Drop rows whose domain is blacklisted, renumbering the remaining rows'
+    IDs so they stay contiguous (1..N) in the output."""
+    kept = [row for row in rows if not is_blacklisted(row.domain, blacklist)]
+    return [
+        SearchResultRow(id=new_id, domain=row.domain, query=row.query)
+        for new_id, row in enumerate(kept, start=1)
+    ]
+
+
+def resolve_results_dir(output_dir: Path) -> Path:
+    return output_dir / schemas.RESULTS_DIRNAME
+
+
+def write_results_xlsx(rows: list[SearchResultRow], output_dir: Path) -> Path:
+    results_dir = resolve_results_dir(output_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest_path = results_dir / f"{timestamp}.xlsx"
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["ID", "domain", "query"])
+    for row in rows:
+        sheet.append([row.id, row.domain, row.query])
+    workbook.save(str(dest_path))
+
+    return dest_path
+
+
+@dataclass(frozen=True)
+class SearchCollectionResult:
+    rows: list[SearchResultRow]
+    total_urls: int
+    unparseable_count: int
+
+
+def collect_search_rows(
+    queries: list[str],
+    per_query: int,
+    api_key: str,
+    logger: logging.Logger,
+    http_get: Callable[..., requests.Response] = requests.get,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> SearchCollectionResult:
+    """Search each query via Brave, extract a domain from each result URL, and
+    dedupe domains across all queries (first query to surface a domain wins).
+    Returns the kept rows plus URL/parsing stats for the caller's summary log."""
+    rows: list[SearchResultRow] = []
+    seen_domains: set[str] = set()
+    next_id = 1
+    total_urls = 0
+    unparseable_count = 0
+    for query in queries:
+        logger.info("Searching query=%r", query)
+        urls = fetch_brave_results(
+            query, per_query, api_key, logger, http_get=http_get, sleep_fn=sleep_fn
+        )
+        logger.info("query=%r returned %d result(s)", query, len(urls))
+        total_urls += len(urls)
+        for url in urls:
+            domain = extract_domain(url)
+            if domain is None:
+                unparseable_count += 1
+                logger.warning(
+                    "Could not extract a domain from url=%r (query=%r); skipping",
+                    url,
+                    query,
+                )
+                continue
+            if domain in seen_domains:
+                continue
+            seen_domains.add(domain)
+            rows.append(SearchResultRow(id=next_id, domain=domain, query=query))
+            next_id += 1
+
+    return SearchCollectionResult(
+        rows=rows, total_urls=total_urls, unparseable_count=unparseable_count
+    )
+
+
+def run_prospect_search(
+    queries_csv_path: Path,
+    per_query: int,
+    api_key: str,
+    logger: logging.Logger,
+    output_dir: Optional[Path] = None,
+    blacklist_path: Optional[Path] = None,
+    http_get: Callable[..., requests.Response] = requests.get,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> Path:
+    resolved_output_dir = output_dir if output_dir is not None else schemas.OUTPUT_DIR
+    resolved_blacklist_path = (
+        blacklist_path if blacklist_path is not None else schemas.BLACKLIST_PATH
+    )
+
+    queries = read_queries(queries_csv_path)
+    logger.info(
+        "Starting prospect search for %d quer%s (per_query=%d)",
+        len(queries),
+        "y" if len(queries) == 1 else "ies",
+        per_query,
+    )
+    if not queries:
+        logger.warning("%s contains no queries; nothing to search", queries_csv_path)
+
+    collection = collect_search_rows(
+        queries, per_query, api_key, logger, http_get=http_get, sleep_fn=sleep_fn
+    )
+    rows = collection.rows
+    duplicate_count = collection.total_urls - len(rows) - collection.unparseable_count
+
+    blacklist = load_blacklist(resolved_blacklist_path)
+    unique_domain_count = len(rows)
+    rows = filter_blacklisted_rows(rows, blacklist)
+    blacklisted_count = unique_domain_count - len(rows)
+    if blacklisted_count:
+        logger.info(
+            "Filtered %d blacklisted domain(s) using %s",
+            blacklisted_count,
+            resolved_blacklist_path,
+        )
+
+    dest_path = write_results_xlsx(rows, resolved_output_dir)
+    logger.info(
+        "Wrote %d unique domain row(s) to %s (%d URL(s) fetched, %d duplicate "
+        "domain(s), %d unparseable URL(s), and %d blacklisted domain(s) dropped)",
+        len(rows),
+        dest_path,
+        collection.total_urls,
+        duplicate_count,
+        collection.unparseable_count,
+        blacklisted_count,
+    )
+    return dest_path
