@@ -15,6 +15,22 @@ EMAIL_PREFIXES_CSV_PATH = Path("/backend/data/email_prefixes_only.csv")
 SCRAPE_DELAY_SECONDS = 3
 # Per-request connect/read timeout for page and robots.txt fetches.
 PAGE_FETCH_TIMEOUT = 15
+# requests' auto-follow is disabled (allow_redirects=False) so every hop can
+# be re-validated (public-IP + robots.txt); this caps how many same-host hops
+# we'll manually follow before giving up.
+MAX_REDIRECTS = 5
+
+# How often (in processed rows) the results workbook is checkpointed to disk
+# during a long contact-scrape run, plus a final save once the loop ends —
+# saving every single row rewrites the whole file each time (O(n^2) bytes
+# written for N rows).
+CHECKPOINT_EVERY_ROWS = 25
+
+# Hard cap on a fetched page's body size (checked via len(response.text) as a
+# close-enough proxy for bytes — exact byte-accuracy isn't critical for this
+# email-regex-scanning use case) to guard against a hostile/broken site
+# spiking memory.
+MAX_PAGE_BYTES = 5 * 1024 * 1024
 
 # Identify the crawler and give site owners a way to reach us (the contact email
 # collected for the run) — standard courtesy for polite scraping.
@@ -34,9 +50,12 @@ EMAIL_PREFIX_SEPARATORS = (".", "-", "_")
 # Columns appended to the results workbook.
 CONTACT_URL_HEADER = "contact_url"
 CONTACT_EMAIL_HEADER = "contact_email"
-# Red fill (ARGB) applied to cells with no contact url/email.
+# Polish for "contact form" — kept verbatim (not translated/snake_cased like
+# the other two headers) per explicit user request.
+CONTACT_FORM_HEADER = "formularz kontaktowy"
+# Red fill (ARGB) applied to cells with no contact url/email (cell value is
+# left empty rather than a literal "None" string — see _write_contact_cell).
 NONE_FILL_COLOR = "FFFF0000"
-NONE_CELL_TEXT = "None"
 
 
 def _validate_about_us_csv_path(v: Path) -> Path:

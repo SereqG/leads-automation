@@ -9,9 +9,12 @@ DEFAULT_LOG_DIR = Path("/backend/logs")
 def configure_logging(
     log_file: Optional[Path], level: int = logging.INFO
 ) -> logging.Logger:
-    logger = logging.getLogger(LOGGER_NAME)
+    logger_name = f"{LOGGER_NAME}:{log_file}" if log_file is not None else LOGGER_NAME
+    logger = logging.getLogger(logger_name)
     logger.setLevel(level)
-    logger.handlers.clear()
+    for handler in logger.handlers[:]:
+        handler.close()
+        logger.removeHandler(handler)
 
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 

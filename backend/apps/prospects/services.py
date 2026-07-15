@@ -1,5 +1,6 @@
 import csv
 import logging
+import math
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -210,17 +211,14 @@ def read_queries(csv_path: Path) -> list[str]:
 def compute_pagination_plan(per_query: int) -> list[tuple[int, int]]:
     """Return (count, offset) pairs needed to fetch up to per_query results,
     respecting Brave's limits (count 1-20, offset 0-9, i.e. 200 max/query).
-    Silently caps at the max; callers that want to warn about capping check
-    per_query themselves."""
-    remaining = min(per_query, schemas.BRAVE_MAX_RESULTS_PER_QUERY)
-    pairs: list[tuple[int, int]] = []
-    offset = 0
-    while remaining > 0 and offset <= schemas.BRAVE_MAX_OFFSET:
-        count = min(schemas.BRAVE_MAX_COUNT, remaining)
-        pairs.append((count, offset))
-        remaining -= count
-        offset += 1
-    return pairs
+    Brave's `offset` is measured in pages of `count` (skip = offset * count),
+    so `count` is kept constant at BRAVE_MAX_COUNT across every page here;
+    callers are responsible for truncating the fetched results down to
+    per_query afterwards. Silently caps at the max; callers that want to
+    warn about capping check per_query themselves."""
+    target = min(per_query, schemas.BRAVE_MAX_RESULTS_PER_QUERY)
+    pages = math.ceil(target / schemas.BRAVE_MAX_COUNT)
+    return [(schemas.BRAVE_MAX_COUNT, offset) for offset in range(pages)]
 
 
 def fetch_brave_results(
@@ -257,9 +255,10 @@ def fetch_brave_results(
                 timeout=30,
             )
             response.raise_for_status()
-        except requests.RequestException as exc:
+            payload = response.json()
+        except (requests.RequestException, ValueError) as exc:
             logger.error(
-                "Brave Search request failed for query=%r count=%d offset=%d: %s",
+                "Brave request/parse failed for query=%r count=%d offset=%d: %s",
                 query,
                 count,
                 offset,
@@ -267,7 +266,8 @@ def fetch_brave_results(
             )
             break
 
-        page_results = response.json().get("web", {}).get("results", [])
+        web = payload.get("web") if isinstance(payload, dict) else None
+        page_results = (web or {}).get("results", [])
         urls.extend(item["url"] for item in page_results if "url" in item)
 
         if len(page_results) < count:
@@ -280,7 +280,7 @@ def fetch_brave_results(
             )
             break
 
-    return urls
+    return urls[:per_query]
 
 
 def load_blacklist(blacklist_path: Path) -> set[str]:

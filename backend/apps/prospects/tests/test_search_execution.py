@@ -35,15 +35,18 @@ class FakeResponse:
 @pytest.mark.parametrize(
     "per_query, expected",
     [
-        (5, [(5, 0)]),
+        (5, [(20, 0)]),
         (20, [(20, 0)]),
-        (45, [(20, 0), (20, 1), (5, 2)]),
+        (45, [(20, 0), (20, 1), (20, 2)]),
         (200, [(20, i) for i in range(10)]),
         (201, [(20, i) for i in range(10)]),
         (500, [(20, i) for i in range(10)]),
     ],
 )
 def test_compute_pagination_plan(per_query, expected):
+    # count stays fixed at BRAVE_MAX_COUNT on every page (Brave's offset is
+    # measured in pages of `count`, so it can't shrink on the last page);
+    # truncation down to per_query happens in fetch_brave_results instead.
     assert services.compute_pagination_plan(per_query) == expected
 
 
@@ -71,8 +74,9 @@ def test_fetch_brave_results_paginates_across_offsets():
         calls.append(params)
         offset = params["offset"]
         count = params["count"]
-        size = count if offset < 2 else 5
-        results = [{"url": f"https://example.com/{offset}-{i}"} for i in range(size)]
+        # Real Brave semantics: count is constant across pages (offset skips
+        # offset * count results), so every page returns a full page here.
+        results = [{"url": f"https://example.com/{offset}-{i}"} for i in range(count)]
         return FakeResponse({"web": {"results": results}})
 
     sleeps = []
@@ -86,7 +90,8 @@ def test_fetch_brave_results_paginates_across_offsets():
     )
 
     assert [c["offset"] for c in calls] == [0, 1, 2]
-    assert [c["count"] for c in calls] == [20, 20, 5]
+    assert [c["count"] for c in calls] == [20, 20, 20]
+    # 3 pages of 20 = 60 fetched, truncated down to per_query=45.
     assert len(urls) == 45
     assert sleeps == [5, 5, 5]
 
@@ -129,7 +134,35 @@ def test_fetch_brave_results_stops_query_on_request_exception(caplog):
 
     assert urls == []
     assert sleeps == [5]
-    assert any("Brave Search request failed" in r.message for r in caplog.records)
+    assert any("Brave request/parse failed" in r.message for r in caplog.records)
+
+
+def test_fetch_brave_results_stops_query_on_invalid_json(caplog):
+    class BadJsonResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            raise ValueError("Expecting value")
+
+    def fake_http_get(url, headers, params, timeout):
+        return BadJsonResponse()
+
+    sleeps = []
+    logger = logging.getLogger("test-fetch-badjson")
+    with caplog.at_level(logging.ERROR, logger="test-fetch-badjson"):
+        urls = services.fetch_brave_results(
+            "plumbers",
+            20,
+            "key",
+            logger,
+            http_get=fake_http_get,
+            sleep_fn=sleeps.append,
+        )
+
+    assert urls == []
+    assert sleeps == [5]
+    assert any("Brave request/parse failed" in r.message for r in caplog.records)
 
 
 def test_fetch_brave_results_warns_when_per_query_exceeds_cap(caplog):

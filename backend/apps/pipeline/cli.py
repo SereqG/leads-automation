@@ -1,4 +1,3 @@
-import logging
 from pathlib import Path
 from typing import Optional
 
@@ -7,7 +6,7 @@ import typer
 from apps.enrichment import services as enrichment_services
 from apps.prospects import services as prospects_services
 from core.exceptions import ValidationFailedError
-from core.logging import LOGGER_NAME
+from core.logging import configure_logging
 
 from . import services
 
@@ -64,7 +63,7 @@ def run(
         fg=typer.colors.GREEN,
     )
 
-    logger = logging.getLogger(LOGGER_NAME)
+    logger = configure_logging(log_file=search_config.log_file)
     queries_path = prospects_services.check_and_deduplicate_queries(
         search_config.queries_csv_path, logger, _confirm_deduplication
     )
@@ -95,7 +94,8 @@ def run(
     typer.echo(
         f"Results will be written under "
         f"{prospects_services.resolve_results_dir(search_config.output_dir)} once "
-        f"the search stage completes; contact_url/contact_email columns will be "
-        f"added once the enrichment stage completes. Progress is logged to "
+        f"the search stage completes; contact_url/contact_email/formularz "
+        f"kontaktowy columns will be added once the enrichment stage "
+        f"completes. Progress is logged to "
         f"{search_config.log_file} and {enrich_config.log_file}."
     )
